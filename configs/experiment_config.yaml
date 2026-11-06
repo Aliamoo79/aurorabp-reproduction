@@ -1,0 +1,91 @@
+# Aurora-BP reproduction settings.
+# Labels: [PAPER] [GITHUB] [BOTH] [DECISION] [UNKNOWN]
+# A value marked [DECISION] is not an author setting.
+
+dataset:
+  # This copy is split into two protocol archives. [DECISION] paths supplied for this Drive copy.
+  dataset_dir: "/content/drive/MyDrive/aurora_dataset"
+  auscultatory_zip: "/content/drive/MyDrive/aurora_dataset/measurements_auscultatory (1).zip"
+  oscillometric_zip: "/content/drive/MyDrive/aurora_dataset/measurements_oscillometric.zip"
+  output_dir: "/content/aurorabp_outputs"  # [DECISION] Colab local disk, not inside the dataset
+  # Extracted waveforms live on the Colab VM disk. The VM disk is erased when the runtime resets. [DECISION]
+  colab_extract_dir: "/content/aurora_waveforms"
+
+sampling:
+  # Released waveform files use a common timebase. [GITHUB]
+  released_hz: 500
+  # Native device rates, not the rate of the released files. [GITHUB]
+  device_hz:
+    tonometry_pressure: 200
+    tonometry_ecg: 488.28
+    tonometry_accel: 100
+    optical_ppg: 250
+    optical_ecg: 498.67
+    optical_accel: 100
+
+filters:
+  # Paper does not state causal versus zero-phase. [UNKNOWN] in the sources.
+  # Zero-phase is used so timing features are not shifted by group delay. [DECISION]
+  zero_phase: true
+  # Design at the released 500 Hz timebase. The paper does not state the design rate. [DECISION]
+  design_hz: 500
+  ecg:
+    # [PAPER] II-B, in this order.
+    dc_cutoff_hz: 0.1
+    dc_kind: butterworth_highpass_order_1  # [DECISION] type was not specified
+    lowpass_order: 7
+    lowpass_pass_hz: 40
+    lowpass_stop_hz: 45
+    lowpass_passband_ripple_db: 0.1
+    # Rs is not in the paper. 40 dB is the stopband attenuation for which
+    # ellipord returns order 7 at these edges and ripple. [DECISION]
+    lowpass_stopband_attenuation_db: 40
+    notch_order: 6
+    notch_center_hz: 60
+    notch_q: 3
+    notch_passband_ripple_db: 0.1
+    # Q = f0 / bandwidth, so the stopband is 50–70 Hz. [DECISION]
+    notch_q_definition: center_over_bandwidth
+  ppg:
+    highpass_order: 4
+    highpass_cutoff_hz: 0.25
+    lowpass_pass_hz: 10
+    lowpass_stop_hz: 12
+    lowpass_passband_ripple_db: 1
+    lowpass_stopband_attenuation_db: 60
+    # Shortest odd remez length at 500 Hz that meets the inequalities. [DECISION]
+    lowpass_numtaps: 521
+  tonometry:
+    highpass_stop_hz: 0.2
+    highpass_pass_hz: 0.3
+    highpass_stopband_attenuation_db: 60
+    highpass_passband_ripple_db: 1
+    # Order is not in the paper. Minimum order from ellipord is 6. [DECISION]
+    highpass_order: 6
+    lowpass_order: 7
+    lowpass_pass_hz: 22
+    lowpass_stop_hz: 26
+    lowpass_passband_ripple_db: 0.1
+    lowpass_stopband_attenuation_db: 40  # [DECISION] same reason as the ECG lowpass
+
+quality:
+  # Numeric threshold is in the repository, not in the paper. [GITHUB]
+  inclusion_threshold: 0.65
+  # Sample files use -1 when no waveform was generated. [DECISION] treat as missing
+  missing_sentinel: -1
+
+evaluation:
+  # [PAPER]
+  young_age_max: 35
+  # Methods use <= 130. Figure 3 caption uses < 130. [UNKNOWN] which one the tables used.
+  normotensive_resting_sbp_max: 130
+  normotensive_comparison: "<="
+  bootstrap_replicates_final: 100
+  bootstrap_fraction: 0.90
+  # With versus without replacement is not stated. [DECISION] without replacement.
+  bootstrap_with_replacement: false
+  ambulatory_minimum_measurements: 17
+  # Sign is not stated. [DECISION] error = prediction - reference.
+  error_definition: prediction_minus_reference
+  # Example notebook alpha is not the paper's alpha. [UNKNOWN]
+  ridge_alpha: null
