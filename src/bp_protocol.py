@@ -98,6 +98,119 @@ QUALITY_COLUMN = {
 
 STATIC_FEATURES = ["baseline_sbp", "baseline_dbp", "cos_hour", "sin_hour"]
 
+# Boxes in docs/data_provenance.png. [GITHUB]
+# Consent, opt-out, miswear, file failure, and the two-ECG alignment discard
+# are not rows in the released tables. Waveform folders begin at the aligned box.
+PROVENANCE_BOXES = {
+    "auscultatory": {"aligned_featurized": 672, "analyzed": 642},
+    "oscillometric": {"aligned_featurized": 548, "analyzed": 483},
+}
+
+
+def _protocol_counts(identifiers) -> Dict[str, int]:
+    values = pd.Index(pd.unique(pd.Series(identifiers).astype(str)))
+    return {
+        "auscultatory": int(values.str.startswith("a").sum()),
+        "oscillometric": int(values.str.startswith("o").sum()),
+        "total": int(values.size),
+    }
+
+
+def aligned_participant_ids(*measurement_frames: Optional[pd.DataFrame]) -> pd.Index:
+    """Participants with at least one generated waveform. [GITHUB] aligned, featurized."""
+    kept: List[pd.Series] = []
+    for frame in measurement_frames:
+        if frame is None or frame.empty or "pid" not in frame.columns:
+            continue
+        if "waveforms_generated" in frame.columns:
+            generated = pd.to_numeric(frame["waveforms_generated"], errors="coerce")
+            kept.append(frame.loc[generated.eq(1), "pid"].astype(str))
+        elif "waveform_file_path" in frame.columns:
+            path = frame["waveform_file_path"]
+            present = path.notna() & path.astype(str).str.strip().ne("") & path.astype(str).ne("nan")
+            kept.append(frame.loc[present, "pid"].astype(str))
+    if not kept:
+        return pd.Index([])
+    return pd.Index(pd.concat(kept, ignore_index=True).unique())
+
+
+def analyzed_participant_ids(participants: pd.DataFrame, features: pd.DataFrame) -> pd.Index:
+    """Final provenance box. [GITHUB] in_feature_table is the released analyzed cohort."""
+    if participants is not None and "in_feature_table" in participants.columns:
+        flag = participants["in_feature_table"]
+        if flag.dtype == bool:
+            keep = flag.fillna(False)
+        else:
+            numeric = pd.to_numeric(flag, errors="coerce")
+            if numeric.notna().any():
+                keep = numeric.fillna(0).eq(1)
+            else:
+                keep = flag.astype(str).str.strip().str.lower().isin(["1", "true", "yes"])
+        return pd.Index(participants.loc[keep, "pid"].astype(str).unique())
+    return pd.Index(features["pid"].astype(str).unique())
+
+
+def provenance_report(
+    participants: pd.DataFrame,
+    features: pd.DataFrame,
+    auscultatory_measurements: Optional[pd.DataFrame] = None,
+    oscillometric_measurements: Optional[pd.DataFrame] = None,
+) -> Dict[str, object]:
+    """Compare the released files with the provenance figure.
+
+    Stages above the aligned box cannot be replayed: those participants are
+    not in the release. Quality failure is the aligned participant who is
+    absent from in_feature_table.
+    """
+    released = _protocol_counts(participants["pid"])
+    analyzed = analyzed_participant_ids(participants, features)
+    analyzed_counts = _protocol_counts(analyzed)
+    feature_counts = _protocol_counts(features["pid"])
+    aligned = aligned_participant_ids(auscultatory_measurements, oscillometric_measurements)
+    aligned_counts = _protocol_counts(aligned) if aligned.size else None
+    report: Dict[str, object] = {
+        "released_participants": released,
+        "feature_table_participants": feature_counts,
+        "analyzed": analyzed_counts,
+        "aligned_featurized": aligned_counts,
+        "paper_boxes": PROVENANCE_BOXES,
+        "analyzed_ids": analyzed,
+    }
+    print("provenance: released participants", released, flush=True)
+    if aligned_counts is not None:
+        print("provenance: aligned, featurized (waveforms_generated==1)", aligned_counts, flush=True)
+        for protocol, boxes in PROVENANCE_BOXES.items():
+            observed = aligned_counts[protocol]
+            expected = boxes["aligned_featurized"]
+            print(f"provenance: {protocol} aligned {observed} versus figure {expected}", flush=True)
+    print("provenance: analyzed (in_feature_table)", analyzed_counts, flush=True)
+    print("provenance: distinct pids inside features.tsv", feature_counts, flush=True)
+    for protocol, boxes in PROVENANCE_BOXES.items():
+        observed = analyzed_counts[protocol]
+        expected = boxes["analyzed"]
+        print(f"provenance: {protocol} analyzed {observed} versus figure {expected}", flush=True)
+        if aligned_counts is not None:
+            failed = aligned_counts[protocol] - observed
+            print(f"provenance: {protocol} quality-failure participants {failed}", flush=True)
+    outside = int((~participants["pid"].astype(str).isin(set(analyzed))).sum())
+    print(f"provenance: participants outside the analyzed box {outside}", flush=True)
+    return report
+
+
+def restrict_to_analyzed(features: pd.DataFrame, participants: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Keep feature rows for the analyzed provenance box before any model fit."""
+    if participants is None:
+        print("provenance: participants.tsv was not passed; features.tsv pids are used as-is", flush=True)
+        return features
+    report = provenance_report(participants, features)
+    analyzed = set(report["analyzed_ids"])
+    kept = features.loc[features["pid"].astype(str).isin(analyzed)].copy()
+    print(
+        f"provenance: model input {kept['pid'].nunique()} participants, {len(kept)} feature rows",
+        flush=True,
+    )
+    return kept
+
 
 def add_time_features(frame: pd.DataFrame) -> pd.DataFrame:
     """Clock hour from the timestamp, without timezone conversion. [DECISION]"""
@@ -114,29 +227,33 @@ def exercise_mask(measurements: pd.Series) -> pd.Series:
     return measurements.astype(str).str.contains(EXERCISE_PATTERN, na=False)
 
 
+def _ridge_apply(train_x: np.ndarray, train_y: np.ndarray, test_x: np.ndarray, alpha: float = RIDGE_ALPHA) -> np.ndarray:
+    """Standardize on the training rows and keep the intercept unpenalized."""
+    center = train_x.mean(axis=0)
+    scale = train_x.std(axis=0)
+    scale[scale < 1e-8] = 1.0
+    train_z = (train_x - center) / scale
+    target_center = float(train_y.mean())
+    penalty = alpha * np.eye(train_x.shape[1])
+    coefficient = np.linalg.solve(
+        train_z.T @ train_z + penalty,
+        train_z.T @ (train_y - target_center),
+    )
+    return ((test_x - center) / scale) @ coefficient + target_center
+
+
 def lopo_predict(values: np.ndarray, target: np.ndarray, groups: np.ndarray, alpha: float = RIDGE_ALPHA) -> np.ndarray:
     """Leave-one-participant-out ridge. Train-fold standardization. [DECISION] alpha."""
     features = np.asarray(values, dtype=float)
     observed = np.asarray(target, dtype=float)
     labels = np.asarray(groups)
     predicted = np.full(observed.shape, np.nan)
-    penalty = alpha * np.eye(features.shape[1])
     for label in pd.unique(labels):
         test = labels == label
         train = ~test
         if int(train.sum()) < features.shape[1] + 1:
             continue
-        train_x = features[train]
-        center = train_x.mean(axis=0)
-        scale = train_x.std(axis=0)
-        scale[scale < 1e-8] = 1.0
-        train_z = (train_x - center) / scale
-        target_center = float(observed[train].mean())
-        coefficient = np.linalg.solve(
-            train_z.T @ train_z + penalty,
-            train_z.T @ (observed[train] - target_center),
-        )
-        predicted[test] = ((features[test] - center) / scale) @ coefficient + target_center
+        predicted[test] = _ridge_apply(features[train], observed[train], features[test], alpha)
     return predicted
 
 
@@ -263,8 +380,14 @@ def run_return_visit(
     output_path: Optional[str] = None,
 ) -> pd.DataFrame:
     """Fit separate return-visit models by protocol, population, and feature group."""
+    features = restrict_to_analyzed(features, participants)
     visit, dropped_names = prepare_return_visit(features)
     resting = resting_supine_sbp(features)
+    print(
+        "return visit in-lab only: phase=return, "
+        f"{visit['pid'].nunique()} participants, {len(visit)} rows; ambulatory excluded",
+        flush=True,
+    )
     rows: List[dict] = []
     protocols = {
         "auscultatory": visit.loc[visit["pid"].astype(str).str.startswith("a")],
@@ -294,7 +417,7 @@ def run_return_visit(
                     continue
                 reliability = "official features; alpha and ECG quality rule are decisions"
                 if missing:
-                    reliability = "missing " + ", ".join(missing) + "; not a complete Table IV group"
+                    reliability = "missing " + ", ".join(missing) + "; " + reliability
                 if population == "normotensive":
                     reliability += "; resting SBP rule is a decision"
                 for target in ("delta_sbp", "delta_dbp"):
@@ -352,6 +475,30 @@ def prepare_ambulatory(features: pd.DataFrame) -> pd.DataFrame:
 def cohort_with_minimum(frame: pd.DataFrame, columns: List[str], target: str) -> pd.DataFrame:
     usable = complete_cases(frame, columns, target)
     usable = usable.dropna(subset=["clock_hour"]).reset_index(drop=True)
+    counts = usable.groupby("pid").size()
+    kept = counts[counts >= AMBULATORY_MINIMUM_MEASUREMENTS].index
+    return usable.loc[usable["pid"].isin(kept)].reset_index(drop=True)
+
+
+def shared_ambulatory_cohort(ambulatory: pd.DataFrame) -> pd.DataFrame:
+    """One Figure 7 cohort for every feature group and both baselines.
+
+    A row must pass quality 0.65 on both optical and tonometry and have every
+    released Table IV column. A participant needs at least 17 such rows.
+    [DECISION] The paper states 227 people and does not spell this intersection.
+    """
+    required = ["quality_optical", "quality_pressure", "delta_sbp", "delta_dbp", "clock_hour"]
+    present = ambulatory.dropna(subset=required)
+    both = present.loc[
+        (present["quality_optical"] >= QUALITY_THRESHOLD) & (present["quality_pressure"] >= QUALITY_THRESHOLD)
+    ].copy()
+    columns: List[str] = []
+    for group_columns in FEATURE_GROUPS.values():
+        for column in group_columns:
+            if column in both.columns and column not in columns:
+                columns.append(column)
+    usable = complete_cases(both, columns, "delta_sbp")
+    usable = usable.dropna(subset=["delta_dbp", "clock_hour"]).reset_index(drop=True)
     counts = usable.groupby("pid").size()
     kept = counts[counts >= AMBULATORY_MINIMUM_MEASUREMENTS].index
     return usable.loc[usable["pid"].isin(kept)].reset_index(drop=True)
@@ -430,27 +577,37 @@ def evaluate_24h(
 
 def run_ambulatory_24h(
     features: pd.DataFrame,
+    participants: Optional[pd.DataFrame] = None,
     replicates: int = BOOTSTRAP_REPLICATES,
     seed: int = 2022,
     output_path: Optional[str] = None,
 ) -> pd.DataFrame:
     """24-hour averages for the full oscillometric ambulatory cohort. One population only."""
+    features = restrict_to_analyzed(features, participants)
     ambulatory = prepare_ambulatory(features)
+    shared = shared_ambulatory_cohort(ambulatory)
+    print(
+        f"shared 24h cohort: {shared['pid'].nunique()} participants, {len(shared)} rows; "
+        f"trained inside these rows only (paper Figure 7 reports 227)",
+        flush=True,
+    )
     rows: List[dict] = []
+    reliability = (
+        "shared rows for every group: both sensors >=0.65, all released Table IV columns, "
+        ">=17; model trained inside this cohort; empty hours omitted"
+    )
     for group, columns in FEATURE_GROUPS.items():
-        available = quality_filter(ambulatory, group)
         missing = MISSING_TABLE_FEATURES.get(group, [])
-        reliability = "official features; alpha 1; empty hours are omitted from the 24-hour mean"
+        group_reliability = reliability
         if missing:
-            reliability = "missing " + ", ".join(missing) + "; " + reliability
+            group_reliability = "missing " + ", ".join(missing) + "; " + reliability
+        if shared["pid"].nunique() < 10:
+            print(f"{group}: shared cohort has fewer than 10 participants", flush=True)
+            continue
         for target in ("delta_sbp", "delta_dbp"):
-            usable = cohort_with_minimum(available, columns, target)
-            if usable["pid"].nunique() < 10:
-                print(f"{group} {target}: fewer than 10 participants", flush=True)
-                continue
-            ridge = evaluate_24h(usable, columns, target, replicates=replicates, seed=seed, fit=True)
-            zero = evaluate_24h(usable, columns, target, replicates=replicates, seed=seed, fit=False)
-            static = evaluate_24h(usable, STATIC_FEATURES, target, replicates=replicates, seed=seed, fit=True)
+            ridge = evaluate_24h(shared, columns, target, replicates=replicates, seed=seed, fit=True)
+            zero = evaluate_24h(shared, columns, target, replicates=replicates, seed=seed, fit=False)
+            static = evaluate_24h(shared, STATIC_FEATURES, target, replicates=replicates, seed=seed, fit=True)
             for model, summary in (("ridge", ridge), ("zero", zero), ("static", static)):
                 rows.append(
                     {
@@ -460,7 +617,7 @@ def run_ambulatory_24h(
                         "target": target,
                         "minimum_measurements": AMBULATORY_MINIMUM_MEASUREMENTS,
                         "missing_table_features": ",".join(missing),
-                        "reliability": reliability,
+                        "reliability": group_reliability,
                         **summary,
                     }
                 )
@@ -520,28 +677,35 @@ def run_ambulatory_subsets(
     output_path: Optional[str] = None,
 ) -> pd.DataFrame:
     """24-hour models trained separately on each subpopulation. [PAPER]"""
+    features = restrict_to_analyzed(features, participants)
     ambulatory = prepare_ambulatory(features)
     rows: List[dict] = []
     for population in populations:
-        identifiers = subset_ids(features, participants, population)
+        identifiers = set(subset_ids(features, participants, population).astype(str))
         people = ambulatory.loc[ambulatory["pid"].astype(str).isin(identifiers)].copy()
-        print(f"{population}: {people['pid'].nunique()} ambulatory participants before the minimum", flush=True)
+        shared = shared_ambulatory_cohort(people)
+        print(
+            f"{population}: shared cohort {shared['pid'].nunique()} participants, {len(shared)} rows; trained inside these rows only",
+            flush=True,
+        )
+        reliability = (
+            "separate subpopulation model; shared rows for every group; "
+            "model trained inside this cohort; empty hours omitted"
+        )
+        if population == "normotensive":
+            reliability += "; resting SBP <= 130 from Supine or Calibration start"
         for group, columns in FEATURE_GROUPS.items():
-            available = quality_filter(people, group)
             missing = MISSING_TABLE_FEATURES.get(group, [])
-            reliability = "official features; alpha 1; empty hours omitted; subpopulation model is separate"
-            if population == "normotensive":
-                reliability += "; resting SBP <= 130 from Supine or Calibration start"
+            group_reliability = reliability
             if missing:
-                reliability = "missing " + ", ".join(missing) + "; " + reliability
+                group_reliability = "missing " + ", ".join(missing) + "; " + reliability
+            if shared["pid"].nunique() < 10:
+                print(f"{population} {group}: shared cohort has fewer than 10 participants", flush=True)
+                continue
             for target in ("delta_sbp", "delta_dbp"):
-                usable = cohort_with_minimum(available, columns, target)
-                if usable["pid"].nunique() < 10:
-                    print(f"{population} {group} {target}: fewer than 10 participants", flush=True)
-                    continue
-                ridge = evaluate_24h(usable, columns, target, replicates=replicates, seed=seed, fit=True)
-                zero = evaluate_24h(usable, columns, target, replicates=replicates, seed=seed, fit=False)
-                static = evaluate_24h(usable, STATIC_FEATURES, target, replicates=replicates, seed=seed, fit=True)
+                ridge = evaluate_24h(shared, columns, target, replicates=replicates, seed=seed, fit=True)
+                zero = evaluate_24h(shared, columns, target, replicates=replicates, seed=seed, fit=False)
+                static = evaluate_24h(shared, STATIC_FEATURES, target, replicates=replicates, seed=seed, fit=True)
                 for model, summary in (("ridge", ridge), ("zero", zero), ("static", static)):
                     rows.append(
                         {
@@ -551,7 +715,7 @@ def run_ambulatory_subsets(
                             "target": target,
                             "minimum_measurements": AMBULATORY_MINIMUM_MEASUREMENTS,
                             "missing_table_features": ",".join(missing),
-                            "reliability": reliability,
+                            "reliability": group_reliability,
                             **summary,
                         }
                     )
@@ -602,6 +766,7 @@ def run_return_posture(
     Table VII reports standard deviations. The All column matches the pooled
     return-visit result, so posture columns are slices, not new models. [PAPER]
     """
+    features = restrict_to_analyzed(features, participants)
     visit, _dropped = prepare_return_visit(features)
     visit = visit.loc[visit["pid"].astype(str).str.startswith("a")].copy()
     visit["posture"] = assign_posture(visit["measurement"])
