@@ -29,6 +29,7 @@ EXERCISE_PATTERN = re.compile(r"exercise|running|walking|cool.?down", re.IGNOREC
 # Table IV, using the released delta columns. [PAPER] group membership.
 # [GITHUB] the example model predicts delta_sbp from delta features.
 # Time-of-day terms are absolute, not deltas. [PAPER]
+# Calibration SBP/DBP are not in this dict. group_columns adds them.
 FEATURE_GROUPS: Dict[str, List[str]] = {
     "ecg": [
         "delta_beat_length_ekg",
@@ -96,7 +97,17 @@ QUALITY_COLUMN = {
     "tonometric": "quality_pressure",
 }
 
+# [DECISION] Table IV does not list these. The static baseline does, and the
+# published sensor-group errors sit on that baseline, so every sensor model
+# gets the same two calibration inputs. The static model itself is unchanged.
+CALIBRATION_FEATURES = ["baseline_sbp", "baseline_dbp"]
+
 STATIC_FEATURES = ["baseline_sbp", "baseline_dbp", "cos_hour", "sin_hour"]
+
+
+def group_columns(group: str) -> List[str]:
+    """Sensor columns for one feature group, including calibration pressure."""
+    return list(dict.fromkeys(CALIBRATION_FEATURES + FEATURE_GROUPS[group]))
 
 # Boxes in docs/data_provenance.png. [GITHUB]
 # Consent, opt-out, miswear, file failure, and the two-ECG alignment discard
@@ -359,8 +370,8 @@ def population_frame(frame: pd.DataFrame, participants: pd.DataFrame, population
     if population == "normotensive":
         if resting is None:
             return frame.iloc[0:0]
-        kept = resting.loc[resting <= NORMOTENSIVE_RESTING_SBP_MAX].index
-        return frame.loc[frame["pid"].isin(kept)]
+        kept = resting.loc[resting <= NORMOTENSIVE_RESTING_SBP_MAX].index.astype(str)
+        return frame.loc[frame["pid"].astype(str).isin(set(kept))]
     raise ValueError(population)
 
 
@@ -381,8 +392,9 @@ def run_return_visit(
 ) -> pd.DataFrame:
     """Fit separate return-visit models by protocol, population, and feature group."""
     features = restrict_to_analyzed(features, participants)
+    print("sensor models include baseline_sbp and baseline_dbp; static baseline unchanged", flush=True)
     visit, dropped_names = prepare_return_visit(features)
-    resting = resting_supine_sbp(features)
+    resting = resting_reference_sbp(features)
     print(
         "return visit in-lab only: phase=return, "
         f"{visit['pid'].nunique()} participants, {len(visit)} rows; ambulatory excluded",
@@ -409,13 +421,14 @@ def run_return_visit(
                     }
                 )
                 continue
-            for group, columns in FEATURE_GROUPS.items():
+            for group in FEATURE_GROUPS:
+                columns = group_columns(group)
                 available = quality_filter(people, group)
                 missing = MISSING_TABLE_FEATURES.get(group, [])
                 if available.empty:
                     print(f"{protocol} {population} {group}: no rows", flush=True)
                     continue
-                reliability = "official features; alpha and ECG quality rule are decisions"
+                reliability = "official features plus calibration SBP/DBP; alpha and ECG quality rule are decisions"
                 if missing:
                     reliability = "missing " + ", ".join(missing) + "; " + reliability
                 if population == "normotensive":
@@ -493,8 +506,8 @@ def shared_ambulatory_cohort(ambulatory: pd.DataFrame) -> pd.DataFrame:
         (present["quality_optical"] >= QUALITY_THRESHOLD) & (present["quality_pressure"] >= QUALITY_THRESHOLD)
     ].copy()
     columns: List[str] = []
-    for group_columns in FEATURE_GROUPS.values():
-        for column in group_columns:
+    for sensor_columns in FEATURE_GROUPS.values():
+        for column in sensor_columns:
             if column in both.columns and column not in columns:
                 columns.append(column)
     usable = complete_cases(both, columns, "delta_sbp")
@@ -583,6 +596,7 @@ def run_ambulatory_24h(
     output_path: Optional[str] = None,
 ) -> pd.DataFrame:
     """24-hour averages for the full oscillometric ambulatory cohort. One population only."""
+    print("sensor models include baseline_sbp and baseline_dbp; static baseline unchanged", flush=True)
     features = restrict_to_analyzed(features, participants)
     ambulatory = prepare_ambulatory(features)
     shared = shared_ambulatory_cohort(ambulatory)
@@ -594,9 +608,10 @@ def run_ambulatory_24h(
     rows: List[dict] = []
     reliability = (
         "shared rows for every group: both sensors >=0.65, all released Table IV columns, "
-        ">=17; model trained inside this cohort; empty hours omitted"
+        ">=17; calibration SBP/DBP in every sensor model; empty hours omitted"
     )
-    for group, columns in FEATURE_GROUPS.items():
+    for group in FEATURE_GROUPS:
+        columns = group_columns(group)
         missing = MISSING_TABLE_FEATURES.get(group, [])
         group_reliability = reliability
         if missing:
@@ -677,6 +692,7 @@ def run_ambulatory_subsets(
     output_path: Optional[str] = None,
 ) -> pd.DataFrame:
     """24-hour models trained separately on each subpopulation. [PAPER]"""
+    print("sensor models include baseline_sbp and baseline_dbp; static baseline unchanged", flush=True)
     features = restrict_to_analyzed(features, participants)
     ambulatory = prepare_ambulatory(features)
     rows: List[dict] = []
@@ -690,11 +706,12 @@ def run_ambulatory_subsets(
         )
         reliability = (
             "separate subpopulation model; shared rows for every group; "
-            "model trained inside this cohort; empty hours omitted"
+            "calibration SBP/DBP in every sensor model; empty hours omitted"
         )
         if population == "normotensive":
             reliability += "; resting SBP <= 130 from Supine or Calibration start"
-        for group, columns in FEATURE_GROUPS.items():
+        for group in FEATURE_GROUPS:
+            columns = group_columns(group)
             missing = MISSING_TABLE_FEATURES.get(group, [])
             group_reliability = reliability
             if missing:
@@ -766,6 +783,7 @@ def run_return_posture(
     Table VII reports standard deviations. The All column matches the pooled
     return-visit result, so posture columns are slices, not new models. [PAPER]
     """
+    print("sensor models include baseline_sbp and baseline_dbp; static baseline unchanged", flush=True)
     features = restrict_to_analyzed(features, participants)
     visit, _dropped = prepare_return_visit(features)
     visit = visit.loc[visit["pid"].astype(str).str.startswith("a")].copy()
@@ -777,7 +795,8 @@ def run_return_posture(
             people = visit
         else:
             people = visit.loc[visit["pid"].astype(str).isin(subset_ids(features, participants, population))].copy()
-        for group, columns in FEATURE_GROUPS.items():
+        for group in FEATURE_GROUPS:
+            columns = group_columns(group)
             available = quality_filter(people, group)
             usable = complete_cases(available, columns, "delta_sbp")
             if "posture" not in usable.columns:
@@ -787,7 +806,7 @@ def run_return_posture(
                 print(f"{population} {group}: fewer than 10 participants", flush=True)
                 continue
             missing = MISSING_TABLE_FEATURES.get(group, [])
-            reliability = "same model sliced by posture; start-without-seat mapped to supine"
+            reliability = "calibration SBP/DBP in the sensor model; same model sliced by posture; start-without-seat mapped to supine"
             if population == "normotensive":
                 reliability += "; resting SBP <= 130 from Calibration start"
             if missing:

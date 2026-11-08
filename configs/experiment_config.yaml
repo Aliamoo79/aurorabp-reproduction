@@ -89,3 +89,8 @@ evaluation:
   error_definition: prediction_minus_reference
   # Example notebook alpha is not the paper's alpha. [UNKNOWN]
   ridge_alpha: null
+  # [DECISION] Not listed in Table IV. Added to every sensor model.
+  # The static baseline already had both columns.
+  calibration_features:
+    - baseline_sbp
+    - baseline_dbp
